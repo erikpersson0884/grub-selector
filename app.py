@@ -9,6 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import zipfile
 
 # --- distro detection (same logic as your installer) ------------------------
 if shutil.which("grub2-mkconfig"):
@@ -78,6 +81,118 @@ def apply_theme(name):
     sys.exit(r.returncode)
 
 
+# --- adding themes ----------------------------------------------------------
+ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2")
+
+
+def _clean_name(name):
+    return re.sub(r"[^A-Za-z0-9._ -]", "_", name).strip(" .") or "theme"
+
+
+def _archive_stem(path):
+    base = os.path.basename(path)
+    for ext in ARCHIVE_EXTS:
+        if base.lower().endswith(ext):
+            return base[: -len(ext)]
+    return os.path.splitext(base)[0]
+
+
+def _shallowest_theme_dir(root_dir):
+    best = None
+    for dirpath, _dirs, files in os.walk(root_dir):
+        if "theme.txt" in files:
+            depth = dirpath.count(os.sep)
+            if best is None or depth < best[0]:
+                best = (depth, dirpath)
+    return best[1] if best else None
+
+
+def find_theme_name(src):
+    """Folder name the theme will get when installed, or None if no theme.txt is found."""
+    if os.path.isdir(src):
+        d = _shallowest_theme_dir(src)
+        return _clean_name(os.path.basename(os.path.abspath(d))) if d else None
+    try:
+        if zipfile.is_zipfile(src):
+            with zipfile.ZipFile(src) as z:
+                names = z.namelist()
+        elif tarfile.is_tarfile(src):
+            with tarfile.open(src) as t:
+                names = [m.name for m in t.getmembers()]
+        else:
+            return None
+    except Exception:
+        return None
+    norm = [re.sub(r"^(\./)+", "", n.replace("\\", "/")) for n in names]
+    cands = [n for n in norm if n.split("/")[-1] == "theme.txt"]
+    if not cands:
+        return None
+    best = min(cands, key=lambda n: n.count("/"))
+    parent = best.rsplit("/", 1)[0] if "/" in best else ""
+    return _clean_name(os.path.basename(parent) if parent else _archive_stem(src))
+
+
+def _safe_member(name):
+    parts = name.replace("\\", "/").split("/")
+    return not os.path.isabs(name) and ".." not in parts
+
+
+def _extract(src, dest):
+    if zipfile.is_zipfile(src):
+        with zipfile.ZipFile(src) as z:
+            if not all(_safe_member(n) for n in z.namelist()):
+                sys.exit("Archive contains unsafe paths")
+            z.extractall(dest)
+    elif tarfile.is_tarfile(src):
+        with tarfile.open(src) as t:
+            members = [m for m in t.getmembers()
+                       if _safe_member(m.name) and (m.isfile() or m.isdir())]
+            try:
+                t.extractall(dest, members=members, filter="data")
+            except TypeError:  # older Python without extraction filters
+                t.extractall(dest, members=members)
+    else:
+        sys.exit("Unsupported file type (use .zip or .tar.gz)")
+
+
+def install_theme(src, replace=False):
+    """Copy a theme folder or archive into the GRUB themes folder. Runs as root."""
+    if os.geteuid() != 0:
+        sys.exit("Must run as root")
+    if not GRUB_DIR:
+        sys.exit("Could not find GRUB (grub-mkconfig / grub2-mkconfig)")
+    name = find_theme_name(src)
+    if not name:
+        sys.exit("No theme.txt found")
+    dest = os.path.join(THEMES_DIR, name)
+    if os.path.exists(dest) and not replace:
+        sys.exit(3)
+    tmp = None
+    try:
+        root_dir = src
+        if not os.path.isdir(src):
+            tmp = tempfile.mkdtemp(prefix="grub-theme-")
+            _extract(src, tmp)
+            root_dir = tmp
+        theme_dir = _shallowest_theme_dir(root_dir)
+        if not theme_dir:
+            sys.exit("No theme.txt found")
+        os.makedirs(THEMES_DIR, exist_ok=True)
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(
+            theme_dir, dest, symlinks=True,
+            ignore=lambda d, names: [n for n in names if os.path.islink(os.path.join(d, n))])
+        for dp, dns, fns in os.walk(dest):  # make it readable for the (non-root) GUI
+            os.chmod(dp, 0o755)
+            for fn in fns:
+                os.chmod(os.path.join(dp, fn), 0o644)
+        print(name)
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 # --- GUI --------------------------------------------------------------------
 def gui():
     import colorsys
@@ -85,7 +200,7 @@ def gui():
     import tkinter as tk
     import tkinter.font as tkfont
     import zlib
-    from tkinter import messagebox
+    from tkinter import filedialog, messagebox
 
     BG, CARD, HOVER = "#1e1e2e", "#2a2b3d", "#34364d"
     ACCENT, ACCENT_HI = "#cba6f7", "#d9bdfa"
@@ -248,7 +363,6 @@ def gui():
         if not themes:
             tk.Label(inner, text=f"No themes found in\n{THEMES_DIR}", font=f_body,
                      bg=BG, fg=MUTED, justify="left").pack(anchor="w", pady=20)
-            return
         for name in themes:
             fr = tk.Frame(inner, bg=CARD, highlightthickness=1,
                           highlightbackground=CARD, cursor="hand2")
@@ -274,6 +388,7 @@ def gui():
                 w.bind("<Enter>", enter)
                 w.bind("<Leave>", leave)
             paint(name)
+        add_row()
 
     # ---- footer: Apply (+ Reboot after a successful apply)
     foot = tk.Frame(root, bg=BG)
@@ -362,6 +477,87 @@ def gui():
         if messagebox.askyesno("Reboot", "Reboot now?"):
             subprocess.Popen(["systemctl", "reboot"])
 
+    # ---- adding a theme (archive or folder)
+    def add_row():
+        fr = tk.Frame(inner, bg=BG)
+        fr.pack(fill="x", pady=(12, 4))
+        tk.Label(fr, text="Add a theme (.zip, .tar.gz or folder)", font=f_small,
+                 bg=BG, fg=MUTED).pack(anchor="w", pady=(0, 6))
+        btns = tk.Frame(fr, bg=BG)
+        btns.pack(fill="x")
+        btns.columnconfigure((0, 1), weight=1, uniform="add")
+        for i, (label, kind) in enumerate((("+  Archive", "archive"), ("+  Folder", "folder"))):
+            b = make_btn(btns, label, CARD, SOFT, HOVER, lambda k=kind: on_add(k))
+            b.configure(font=f_small, pady=9)
+            b.grid(row=0, column=i, sticky="ew", padx=(0, 5) if i == 0 else (5, 0))
+
+    def run_priv(args, done):
+        result = {}
+
+        def work():
+            try:
+                result["r"] = subprocess.run(
+                    ["pkexec", sys.executable, os.path.abspath(__file__)] + args,
+                    capture_output=True, text=True)
+            except FileNotFoundError:
+                result["err"] = "pkexec not found - install polkit."
+
+        def poll():
+            if t.is_alive():
+                root.after(100, poll)
+            else:
+                done(result)
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        root.after(100, poll)
+
+    def on_add(kind):
+        if state["busy"]:
+            return
+        if kind == "archive":
+            src = filedialog.askopenfilename(
+                title="Choose a theme archive",
+                filetypes=[("Theme archives", "*.zip *.tar *.tar.gz *.tgz *.tar.xz *.txz *.tar.bz2 *.tbz2"),
+                           ("All files", "*")])
+        else:
+            src = filedialog.askdirectory(title="Choose a theme folder", mustexist=True)
+        if not src:
+            return
+        name = find_theme_name(src)
+        if not name:
+            show_toast(f"No theme.txt found in that {kind}.", "err")
+            return
+        args = ["--install", os.path.abspath(src)]
+        if name in themes:
+            if not messagebox.askyesno("Replace theme", f"'{name}' is already installed. Replace it?"):
+                return
+            args.append("--replace")
+        state["busy"] = True
+        refresh_button()
+        reboot_btn.grid_remove()
+        show_toast(f"Installing '{name}'... (enter your password)", "info")
+
+        def done(res):
+            state["busy"] = False
+            r = res.get("r")
+            if "err" in res:
+                show_toast(res["err"], "err")
+            elif r.returncode == 0:
+                themes[:] = list_themes()
+                if name in themes:
+                    state["selected"] = name
+                build_rows()
+                show_toast(f"✓  '{name}' added. Select it and apply to use it.", "ok")
+            elif r.returncode in (126, 127):
+                hide_toast()
+            else:
+                show_toast("Install failed - see details.", "err")
+                messagebox.showerror("Failed", (r.stdout + r.stderr)[-1500:])
+            refresh_button()
+
+        run_priv(args, done)
+
     refresh_pill()
     build_rows()
     refresh_button()
@@ -371,5 +567,7 @@ def gui():
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--apply":
         apply_theme(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--install":
+        install_theme(sys.argv[2], "--replace" in sys.argv[3:])
     else:
         gui()

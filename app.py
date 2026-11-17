@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """GRUB Theme Picker - pick a theme from your grub themes folder, apply it, reboot.
 
-Run as a normal user:  python3 app.py
+Run as a normal user:  python3 grub-theme-picker.py
 The GUI asks for your password (via pkexec) only when applying.
 """
+import atexit
+import json
 import os
 import re
 import shutil
@@ -26,13 +28,53 @@ DEFAULTS = "/etc/default/grub"
 BACKUP = DEFAULTS + ".bak-themepicker"
 
 
-def list_themes():
-    if not os.path.isdir(THEMES_DIR):
-        return []
-    return sorted(
-        d for d in os.listdir(THEMES_DIR)
-        if os.path.isfile(os.path.join(THEMES_DIR, d, "theme.txt"))
-    )
+def collect_themes():
+    """List installed themes with preview info: [{"name", "color", "image"}].
+
+    When this runs as root through pkexec, background images are copied into a temporary
+    folder owned by the calling user, so the (non-root) GUI can read them even when the
+    themes folder itself is root-only (common on Fedora).
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(THEMES_DIR))
+    except OSError:
+        return out
+    uid = None
+    if os.geteuid() == 0 and os.environ.get("PKEXEC_UID", "").isdigit():
+        uid = int(os.environ["PKEXEC_UID"])
+    cache = None
+    for name in names:
+        tdir = os.path.join(THEMES_DIR, name)
+        txt_path = os.path.join(tdir, "theme.txt")
+        if not os.path.isfile(txt_path):
+            continue
+        try:
+            with open(txt_path, errors="ignore") as f:
+                txt = f.read()
+        except OSError:
+            txt = ""
+        m = re.search(r'desktop-color:\s*"(#[0-9a-fA-F]{6})"', txt)
+        color = m.group(1) if m else None
+        image = None
+        m = re.search(r'desktop-image:\s*"([^"]+)"', txt)
+        if m:
+            real = os.path.realpath(os.path.join(tdir, m.group(1)))
+            inside = real.startswith(os.path.realpath(tdir) + os.sep)
+            if inside and os.path.isfile(real) and os.path.getsize(real) < 20 * 1024 * 1024:
+                if uid is None:
+                    image = real
+                else:
+                    if cache is None:
+                        cache = tempfile.mkdtemp(prefix="grub-selector-")
+                        os.chown(cache, uid, -1)
+                    dst = os.path.join(cache, f"{len(out)}{os.path.splitext(real)[1]}")
+                    shutil.copyfile(real, dst)
+                    os.chown(dst, uid, -1)
+                    os.chmod(dst, 0o644)
+                    image = dst
+        out.append({"name": name, "color": color, "image": image})
+    return out
 
 
 def current_theme():
@@ -187,7 +229,7 @@ def install_theme(src, replace=False):
             os.chmod(dp, 0o755)
             for fn in fns:
                 os.chmod(os.path.join(dp, fn), 0o644)
-        print(name)
+        print(json.dumps(collect_themes()))
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -222,33 +264,34 @@ def gui():
     f_small, f_tiny, f_btn = (fam, 9), (fam, 8, "bold"), (fam, 11, "bold")
 
     state = {"current": current_theme(), "selected": None, "busy": False}
-    themes = list_themes()
-    if state["current"] in themes:
-        state["selected"] = state["current"]
+    infos, themes = {}, []
+
+    def cleanup_cache():  # remove preview copies made by the privileged helper
+        for i in infos.values():
+            d = os.path.dirname(i.get("image") or "")
+            if os.path.dirname(d) == tempfile.gettempdir() and \
+                    os.path.basename(d).startswith("grub-selector-"):
+                shutil.rmtree(d, ignore_errors=True)
+    atexit.register(cleanup_cache)
+
+    def set_infos(items):
+        cleanup_cache()
+        infos.clear()
+        infos.update({i["name"]: i for i in items})
+        themes[:] = [i["name"] for i in items]
 
     # ---- theme previews: background image if we can load it, else a gradient
-    def read_txt(name):
-        try:
-            with open(os.path.join(THEMES_DIR, name, "theme.txt"), errors="ignore") as f:
-                return f.read()
-        except OSError:
-            return ""
-
     def theme_colors(name):
         h = (zlib.crc32(name.encode()) % 360) / 360.0
         def hx(l, s):
             r, g, b = colorsys.hls_to_rgb(h, l, s)
             return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
         c1, c2 = hx(0.14, 0.45), hx(0.62, 0.65)
-        m = re.search(r'desktop-color:\s*"(#[0-9a-fA-F]{6})"', read_txt(name))
-        return (m.group(1) if m else c1), c2
+        return ((infos.get(name) or {}).get("color") or c1), c2
 
     def load_image(name, w, h):
-        m = re.search(r'desktop-image:\s*"([^"]+)"', read_txt(name))
-        if not m:
-            return None
-        path = os.path.join(THEMES_DIR, name, m.group(1))
-        if not os.path.isfile(path):
+        path = (infos.get(name) or {}).get("image")
+        if not path or not os.path.isfile(path):
             return None
         try:  # Pillow (optional): any format, nicely cropped
             from PIL import Image, ImageTk
@@ -544,7 +587,10 @@ def gui():
             if "err" in res:
                 show_toast(res["err"], "err")
             elif r.returncode == 0:
-                themes[:] = list_themes()
+                try:
+                    set_infos(json.loads(r.stdout.strip().splitlines()[-1]))
+                except (ValueError, IndexError):
+                    pass
                 if name in themes:
                     state["selected"] = name
                 build_rows()
@@ -559,14 +605,60 @@ def gui():
         run_priv(args, done)
 
     refresh_pill()
+    def themes_readable():
+        if not GRUB_DIR:
+            return True
+        # Only need to walk *through* the GRUB folder (x), and read the themes folder (r+x)
+        if not os.access(GRUB_DIR, os.X_OK):
+            return False
+        return not os.path.exists(THEMES_DIR) or os.access(THEMES_DIR, os.R_OK | os.X_OK)
+
+    def finish_load(items):
+        set_infos(items)
+        if state["current"] in themes:
+            state["selected"] = state["current"]
+        build_rows()
+        refresh_button()
+
     build_rows()
     refresh_button()
+    if themes_readable():
+        finish_load(collect_themes())
+    else:
+        # e.g. Fedora: /boot/grub2 is root-only, so ask once (via pkexec) for the list
+        state["busy"] = True
+        show_toast("Loading themes... (enter your password)", "info")
+
+        def loaded(res):
+            state["busy"] = False
+            r = res.get("r")
+            if "err" in res:
+                show_toast(res["err"], "err")
+            elif r.returncode == 0:
+                try:
+                    items = json.loads(r.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    show_toast("Could not read the theme list.", "err")
+                else:
+                    hide_toast()
+                    finish_load(items)
+            elif r.returncode in (126, 127):
+                show_toast("Themes can't be listed without permission. "
+                           "Reopen the app and enter your password.", "err")
+            else:
+                show_toast("Could not list themes - see details.", "err")
+                messagebox.showerror("Failed", (r.stdout + r.stderr)[-1500:])
+            refresh_button()
+
+        root.after(200, lambda: run_priv(["--list"], loaded))
     root.mainloop()
 
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--apply":
         apply_theme(sys.argv[2])
+    elif len(sys.argv) == 2 and sys.argv[1] == "--list":
+        print(json.dumps(collect_themes()))
     elif len(sys.argv) >= 3 and sys.argv[1] == "--install":
         install_theme(sys.argv[2], "--replace" in sys.argv[3:])
     else:

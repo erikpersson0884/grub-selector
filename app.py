@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GRUB Theme Picker - pick a theme from your grub themes folder, apply it, reboot.
 
-Run as a normal user:  python3 grub-theme-picker.py
+Run as a normal user:  python3 app.py
 The GUI asks for your password (via pkexec) only when applying.
 """
 import os
@@ -209,7 +209,7 @@ def gui():
     RED, RED_BG = "#f38ba8", "#3a2430"
     SW_W, SW_H = 72, 44
 
-    root = tk.Tk()
+    root = tk.Tk(className="Grub-selector")  # lets the desktop match the window to its launcher
     root.title("GRUB Theme Picker")
     root.geometry("420x560")
     root.minsize(380, 460)

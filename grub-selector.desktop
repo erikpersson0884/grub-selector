@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=GRUB Selector
+GenericName=Boot Theme Picker
+Comment=Choose and apply your GRUB boot theme
+Exec=grub-selector
+Icon=grub-selector
+Terminal=false
+Categories=System;Settings;
+Keywords=grub;boot;bootloader;theme;
+StartupWMClass=Grub-selector

@@ -1,5 +1,3 @@
-<!-- <img src="docs/images/screenshot.png" alt="GRUB Selector" width="350" align="right"> -->
-
 # GRUB Selector
 
 A small desktop app for switching your GRUB boot theme: open it, pick a theme, apply, reboot.
@@ -8,13 +6,12 @@ A small desktop app for switching your GRUB boot theme: open it, pick a theme, a
 [![Repo Size][repo-size-shield]][repo-size-url]
 [![Author][author-shield]][author-url]
 
-<p align="center">
-  <img src="docs/images/screenshot.png" alt="GRUB Selector" width="300">
-</p>
+
 # Index
 
 1. [About the project](#about-the-project)
 1. [Features](#features)
+1. [Screenshots](#screenshots)
 1. [Built with](#built-with)
 1. [Getting started](#getting-started)
 1. [How it works](#how-it-works)
@@ -45,6 +42,12 @@ This repository contains **only the picker app**. It requires a GRUB bootloader.
 - A **Reboot now** button that appears after a successful change
 - Installs as a regular app, so you can find it by searching in your app launcher
 - Works on Fedora, Debian, Ubuntu and Arch (detects `grub-mkconfig` / `grub2-mkconfig` automatically)
+
+# Screenshots
+
+| Theme picker | Applied theme |
+|---|---|
+| ![GRUB Selector theme picker](docs/images/dashboard.png) | ![GRUB Selector with applied theme](docs/images/applied_theme.png) |
 
 # Getting started
 
